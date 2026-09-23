@@ -2,29 +2,40 @@
 
 ## Overview
 
-`solve()` combines two components: a weighted-centrality qubit placement
-strategy, and a SABRE-style look-ahead router with decay and bidirectional
-refinement. Both are tested against six baseline benchmarks and five
-freshly-generated random programs never used during development, to check
-for overfitting, and against deliberately broken hardware graphs to check
-for robustness.
+`solve()` combines a multi-strategy weighted placement with local search
+refinement, and a SABRE-style look-ahead router with decay and
+bidirectional refinement. Both are tested against six baseline benchmarks
+and five freshly-generated random programs never used during development,
+to check for overfitting, and against deliberately broken hardware graphs
+to check for robustness.
 
 ## Placement Strategy
 
 The baseline's identity placement (logical qubit `i` → physical qubit `i`)
-ignores which qubits actually interact. Instead:
+ignores which qubits actually interact. Instead, `solve()` searches over
+multiple placement strategies and keeps whichever scores best after
+routing:
 
-1. Weight each pair of logical qubits by how many times they interact
-   across the program.
-2. Order logical qubits by total interaction weight (busiest first).
-3. Try every physical qubit as the starting location for the busiest
-   logical qubit (20 seeds on this hardware graph), then greedily place
-   every remaining logical qubit as close as possible — weighted by
-   interaction frequency — to qubits already placed.
-4. Keep whichever seed produces the best final score after routing.
-
-This alone (without any routing improvement) cut total score across the
-six benchmarks from 283.5 to 205.0 (-27.7%).
+1. **Two orderings** of logical qubits are tried: busiest-first (ranked by
+   total interaction count) and a BFS clustering of the interaction graph
+   (so tightly-connected groups of qubits get placed together early).
+   These give 2-opt local search two different starting points, which can
+   land in different local optima.
+2. For each ordering, every physical qubit is tried as the starting
+   location for the first logical qubit in that ordering (20 seeds on
+   this hardware graph), with the rest placed greedily by weighted
+   proximity to already-placed qubits.
+3. Each resulting placement is refined with **2-opt local search** — a
+   standard Quadratic Assignment Problem heuristic: repeatedly try
+   swapping which physical qubit two logical qubits occupy, keeping the
+   swap only if it strictly reduces total weighted distance. This is
+   mathematically guaranteed to terminate (cost strictly decreases over
+   a finite set of placements) and can only ever improve or match the
+   starting placement, never worsen it.
+4. Each refined placement is further improved with one proper SABRE
+   bidirectional pass (see Routing Strategy below).
+5. The single best-scoring combination, across all orderings, seeds, and
+   restarts, is kept.
 
 ## Routing Strategy
 
@@ -51,9 +62,20 @@ de facto industry standard and underlies Qiskit's current transpiler
   An earlier attempt that repeated this loop three times performed worse
   than a single correct pass, confirming the paper's design choice.
 - **Randomized restarts**: ties between near-equal candidate SWAPs are
-  broken with a small, seeded random jitter, and each placement seed is
-  tried 3 times with different tie-breaks, keeping the best result. All
+  broken with a small, seeded random jitter, and each placement is tried
+  3 times with different tie-breaks, keeping the best result. All
   randomness is seeded, so results are fully reproducible.
+- **Post-processing**: any pair of adjacent SWAP operations on the exact
+  same physical pair is removed — this is a mathematical identity (two
+  identical SWAPs in a row cancel out exactly), not a heuristic, so it
+  can only ever reduce SWAP count without affecting correctness.
+
+A separate attempt to add explicit "depth awareness" (biasing SWAP choice
+toward qubits idle longer, to target the score's `0.5×depth` term
+directly) was tested and found to *increase* total score rather than
+decrease it, and was discarded — a useful negative result confirming the
+distance/decay-based heuristic above is closer to a local optimum for
+this router design than that particular depth heuristic.
 
 ## Results
 
@@ -64,11 +86,11 @@ Final score comparison across the six provided benchmarks
 |---|---|---|---|
 | ghz_star | 14.0 | 7.0 | -50.0% |
 | chain_trotter | 15.0 | 4.5 | -70.0% |
-| ladder_trotter | 35.5 | 9.0 | -74.6% |
-| qaoa_random | 39.0 | 14.5 | -62.8% |
-| dense_random | 122.0 | 49.0 | -59.8% |
+| ladder_trotter | 35.5 | 6.5 | -81.7% |
+| qaoa_random | 39.0 | 12.5 | -67.9% |
+| dense_random | 122.0 | 46.0 | -62.3% |
 | vqe_layers | 58.0 | 3.0 | -94.8% |
-| **Total** | **283.5** | **87.0** | **-69.3%** |
+| **Total** | **283.5** | **79.5** | **-72.0%** |
 
 All results are valid under the scorer's full correctness checks (every
 2Q gate on a real hardware edge, exact original program order preserved
@@ -83,15 +105,15 @@ tuning the algorithm):
 
 | Benchmark | Baseline | Ours | Improvement |
 |---|---|---|---|
-| fresh_small | 32.0 | 8.0 | -75.0% |
-| fresh_medium | 51.5 | 22.5 | -56.3% |
-| fresh_dense | 156.0 | 60.0 | -61.5% |
-| fresh_sparse | 52.0 | 7.5 | -85.6% |
-| fresh_large | 262.0 | 106.0 | -59.5% |
-| **Total** | **553.5** | **204.0** | **-63.1%** |
+| fresh_small | 32.0 | 7.0 | -78.1% |
+| fresh_medium | 51.5 | 21.0 | -59.2% |
+| fresh_dense | 156.0 | 58.0 | -62.8% |
+| fresh_sparse | 52.0 | 5.5 | -89.4% |
+| fresh_large | 262.0 | 93.0 | -64.5% |
+| **Total** | **553.5** | **184.5** | **-66.7%** |
 
-The gap between known-benchmark improvement (-69.3%) and fresh-benchmark
-improvement (-63.1%) is 6.2 percentage points — small enough to conclude
+The gap between known-benchmark improvement (-72.0%) and fresh-benchmark
+improvement (-66.7%) is 5.3 percentage points — small enough to conclude
 the algorithm generalizes rather than exploiting quirks of the six
 provided benchmarks.
 
