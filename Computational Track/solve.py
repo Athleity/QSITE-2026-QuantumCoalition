@@ -11,6 +11,29 @@ from starter_kit import (
 
 
 # ─────────────────────────────────────────────────────────────────
+# Robustness: pick a connected region big enough for the program
+# ─────────────────────────────────────────────────────────────────
+
+def _select_workable_component(hardware_graph, logical_qubits):
+    """Restrict work to one connected region of hardware_graph that has
+    enough physical qubits for the program. Handles disconnected hardware
+    graphs and raises a clear error (instead of crashing or looping
+    forever) if no single connected region is big enough."""
+    components = sorted(nx.connected_components(hardware_graph), key=len, reverse=True)
+    needed = len(logical_qubits)
+    if not components:
+        raise ValueError("hardware_graph has no nodes.")
+    for comp in components:
+        if len(comp) >= needed:
+            return hardware_graph.subgraph(comp).copy()
+    raise ValueError(
+        f"Program needs {needed} qubits, but the largest connected region of "
+        f"hardware_graph only has {len(components[0])} mutually reachable qubits. "
+        f"This program cannot be routed on this hardware graph."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
 # Placement
 # ─────────────────────────────────────────────────────────────────
 
@@ -103,9 +126,6 @@ def _route_sabre(program, hardware_graph, placement, dist, rng=None,
                     cost += wt * dist[new_current[li]][new_current[lj]]
                 cost += swap_decay[a] + swap_decay[b]
 
-                # Tiny random jitter to break ties differently across restarts.
-                # Small enough to never override a genuinely better candidate,
-                # only to pick among truly tied ones differently each attempt.
                 if rng is not None:
                     cost += rng.uniform(0, jitter)
 
@@ -146,8 +166,6 @@ def _route_sabre(program, hardware_graph, placement, dist, rng=None,
 
 
 def _route_sabre_with_final(program, hardware_graph, placement, dist, rng=None):
-    """Same router as _route_sabre, but also returns the final qubit layout
-    reached at the end of routing (needed for bidirectional refinement)."""
     routed = _route_sabre(program, hardware_graph, placement, dist, rng=rng)
     current = dict(placement)
     phys_to_log = {p: l for l, p in current.items()}
@@ -169,18 +187,24 @@ def _route_sabre_with_final(program, hardware_graph, placement, dist, rng=None):
 
 def solve(program, hardware_graph, restarts_per_seed=3, base_seed=42):
     """
-    Placement: for each possible seed location, get a weighted placement,
-    refine it with one proper SABRE bidirectional pass (forward, backward,
-    forward). Routing uses look-ahead + decay, with small randomized
-    tie-breaking, tried a few times per placement seed to explore more of
-    the search space — keep whichever attempt scores best overall.
+    Robustness: restricts work to a single connected region of
+    hardware_graph big enough for the program. Raises a clear ValueError
+    if the graph is disconnected in a way that makes the program
+    unroutable, instead of crashing or looping forever.
 
-    All runs are seeded (via `base_seed`) so results are fully reproducible
-    between runs, not flaky.
+    Placement: for each possible seed location within that region, get a
+    weighted placement, refine it with one proper SABRE bidirectional pass
+    (forward, backward, forward).
+
+    Routing: SABRE-style look-ahead with decay, with small randomized
+    tie-breaking tried a few times per placement seed. All runs are
+    seeded (via base_seed) so results are fully reproducible.
     """
     order, interaction_weight = _order_by_weight(program)
-    dist = dict(nx.all_pairs_shortest_path_length(hardware_graph))
-    physical_nodes = list(hardware_graph.nodes)
+    work_graph = _select_workable_component(hardware_graph, order)
+
+    dist = dict(nx.all_pairs_shortest_path_length(work_graph))
+    physical_nodes = list(work_graph.nodes)
     reversed_program = list(reversed(program))
 
     best_score, best_result = None, None
@@ -194,15 +218,17 @@ def solve(program, hardware_graph, restarts_per_seed=3, base_seed=42):
             attempt += 1
 
             _, mid_placement = _route_sabre_with_final(
-                program, hardware_graph, placement, dist, rng=rng
+                program, work_graph, placement, dist, rng=rng
             )
             _, mid_placement2 = _route_sabre_with_final(
-                reversed_program, hardware_graph, mid_placement, dist, rng=rng
+                reversed_program, work_graph, mid_placement, dist, rng=rng
             )
             routed, _ = _route_sabre_with_final(
-                program, hardware_graph, mid_placement2, dist, rng=rng
+                program, work_graph, mid_placement2, dist, rng=rng
             )
 
+            # Validate against the ORIGINAL hardware_graph (work_graph's
+            # edges are a strict subset of it, so this is always meaningful).
             result = score_summary(program, hardware_graph, mid_placement2, routed)
             if not result["valid"]:
                 continue
@@ -233,6 +259,54 @@ def _generalization_suite():
         "fresh_sparse": _random_program(18, 15, seed=404),
         "fresh_large": _random_program(20, 60, seed=505),
     }
+
+
+# ─────────────────────────────────────────────────────────────────
+# Robustness check: disconnected hardware graphs & oversized programs
+# ─────────────────────────────────────────────────────────────────
+
+def _robustness_suite():
+    print("\nROBUSTNESS CHECK (edge cases that used to crash)")
+    print("-" * 60)
+
+    # 1. Disconnected hardware graph, but each island is big enough on its
+    #    own for a program that only uses qubits within one island.
+    disconnected = nx.Graph()
+    disconnected.add_edges_from([(0, 1), (1, 2), (2, 3)])          # island A: 4 nodes
+    disconnected.add_edges_from([(10, 11), (11, 12), (12, 13)])    # island B: 4 nodes
+    small_program = [("2Q", 0, 1), ("2Q", 1, 2), ("2Q", 2, 3)]
+    try:
+        result = solve(small_program, disconnected)
+        pl, rt = result
+        check = score_summary(small_program, disconnected, pl, rt)
+        print(f"1. Disconnected graph, program fits one island: "
+              f"{'PASS' if check['valid'] else 'FAIL'} (score {check['score']:.1f})")
+    except Exception as exc:
+        print(f"1. Disconnected graph, program fits one island: CRASHED -> {exc}")
+
+    # 2. Disconnected hardware graph where the program genuinely can't fit
+    #    in any single island -> should raise a clear error, not crash.
+    too_big_program = [("2Q", i, i + 1) for i in range(7)]  # needs 8 qubits
+    try:
+        solve(too_big_program, disconnected)
+        print("2. Program too big for any single island: "
+              "did NOT raise an error (unexpected)")
+    except ValueError as exc:
+        print(f"2. Program too big for any single island: PASS -> raised clear error: {exc}")
+    except Exception as exc:
+        print(f"2. Program too big for any single island: CRASHED with wrong error type -> {exc}")
+
+    # 3. Program needs more qubits than the ENTIRE hardware graph has.
+    tiny_graph = nx.path_graph(3)  # only 3 physical qubits
+    oversized_program = [("2Q", i, i + 1) for i in range(9)]  # needs 10 qubits
+    try:
+        solve(oversized_program, tiny_graph)
+        print("3. Program bigger than entire hardware graph: "
+              "did NOT raise an error (unexpected)")
+    except ValueError as exc:
+        print(f"3. Program bigger than entire hardware graph: PASS -> raised clear error: {exc}")
+    except Exception as exc:
+        print(f"3. Program bigger than entire hardware graph: CRASHED with wrong error type -> {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -286,3 +360,5 @@ if __name__ == "__main__":
         print("-> some gap, worth a closer look but not alarming")
     else:
         print("-> significant gap, likely overfit to known benchmarks")
+
+    _robustness_suite()
