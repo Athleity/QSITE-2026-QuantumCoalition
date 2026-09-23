@@ -10,15 +10,7 @@ from starter_kit import (
 )
 
 
-# ─────────────────────────────────────────────────────────────────
-# Robustness: pick a connected region big enough for the program
-# ─────────────────────────────────────────────────────────────────
-
 def _select_workable_component(hardware_graph, logical_qubits):
-    """Restrict work to one connected region of hardware_graph that has
-    enough physical qubits for the program. Handles disconnected hardware
-    graphs and raises a clear error (instead of crashing or looping
-    forever) if no single connected region is big enough."""
     components = sorted(nx.connected_components(hardware_graph), key=len, reverse=True)
     needed = len(logical_qubits)
     if not components:
@@ -32,10 +24,6 @@ def _select_workable_component(hardware_graph, logical_qubits):
         f"This program cannot be routed on this hardware graph."
     )
 
-
-# ─────────────────────────────────────────────────────────────────
-# Placement
-# ─────────────────────────────────────────────────────────────────
 
 def _order_by_weight(program):
     interaction_weight = {}
@@ -51,6 +39,37 @@ def _order_by_weight(program):
         total_weight[j] += w
     order = sorted(logical_qubits, key=lambda q: -total_weight[q])
     return order, interaction_weight
+
+
+def _order_by_bfs_clustering(program, interaction_weight):
+    logical_qubits = sorted({q for op in program for q in op[1:]})
+    adj = {q: [] for q in logical_qubits}
+    for (i, j), w in interaction_weight.items():
+        adj[i].append((j, w))
+        adj[j].append((i, w))
+    for q in adj:
+        adj[q].sort(key=lambda x: -x[1])
+
+    total_weight = {q: 0 for q in logical_qubits}
+    for (i, j), w in interaction_weight.items():
+        total_weight[i] += w
+        total_weight[j] += w
+    start = max(logical_qubits, key=lambda q: total_weight[q])
+
+    visited = {start}
+    order = [start]
+    frontier = [start]
+    while len(order) < len(logical_qubits):
+        if not frontier:
+            remaining = [q for q in logical_qubits if q not in visited]
+            frontier = [max(remaining, key=lambda q: total_weight[q])]
+        node = frontier.pop(0)
+        for nbr, _ in adj[node]:
+            if nbr not in visited:
+                visited.add(nbr)
+                order.append(nbr)
+                frontier.append(nbr)
+    return order
 
 
 def _weighted_placement(order, interaction_weight, dist, physical_nodes, seed):
@@ -72,9 +91,32 @@ def _weighted_placement(order, interaction_weight, dist, physical_nodes, seed):
     return placement
 
 
-# ─────────────────────────────────────────────────────────────────
-# SABRE-style look-ahead router with decay + randomized tie-breaking
-# ─────────────────────────────────────────────────────────────────
+def _two_opt_refine_placement(placement, interaction_weight, dist, max_passes=15):
+    logical_qubits = list(placement.keys())
+
+    def total_cost(pl):
+        return sum(w * dist[pl[i]][pl[j]] for (i, j), w in interaction_weight.items())
+
+    current = dict(placement)
+    current_cost = total_cost(current)
+
+    for _ in range(max_passes):
+        improved = False
+        for ai in range(len(logical_qubits)):
+            for bi in range(ai + 1, len(logical_qubits)):
+                i, j = logical_qubits[ai], logical_qubits[bi]
+                candidate = dict(current)
+                candidate[i], candidate[j] = current[j], current[i]
+                candidate_cost = total_cost(candidate)
+                if candidate_cost < current_cost - 1e-9:
+                    current = candidate
+                    current_cost = candidate_cost
+                    improved = True
+        if not improved:
+            break
+
+    return current
+
 
 def _route_sabre(program, hardware_graph, placement, dist, rng=None,
                   window=8, decay_step=0.05, decay_reset_every=15,
@@ -165,8 +207,8 @@ def _route_sabre(program, hardware_graph, placement, dist, rng=None,
     return routed
 
 
-def _route_sabre_with_final(program, hardware_graph, placement, dist, rng=None):
-    routed = _route_sabre(program, hardware_graph, placement, dist, rng=rng)
+def _route_sabre_with_final(program, hardware_graph, placement, dist, rng=None, window=8):
+    routed = _route_sabre(program, hardware_graph, placement, dist, rng=rng, window=window)
     current = dict(placement)
     phys_to_log = {p: l for l, p in current.items()}
     for op in routed:
@@ -181,27 +223,44 @@ def _route_sabre_with_final(program, hardware_graph, placement, dist, rng=None):
     return routed, current
 
 
-# ─────────────────────────────────────────────────────────────────
-# Final solve() — this is what gets submitted
-# ─────────────────────────────────────────────────────────────────
+def _cancel_redundant_swaps(routed_program):
+    changed = True
+    ops = list(routed_program)
+    while changed:
+        changed = False
+        i = 0
+        new_ops = []
+        while i < len(ops):
+            if (
+                i + 1 < len(ops)
+                and ops[i][0] == "SWAP"
+                and ops[i + 1][0] == "SWAP"
+                and {ops[i][1], ops[i][2]} == {ops[i + 1][1], ops[i + 1][2]}
+            ):
+                i += 2
+                changed = True
+            else:
+                new_ops.append(ops[i])
+                i += 1
+        ops = new_ops
+    return ops
 
-def solve(program, hardware_graph, restarts_per_seed=3, base_seed=42):
+
+def solve(program, hardware_graph, restarts_per_seed=3, base_seed=42, window=8):
     """
-    Robustness: restricts work to a single connected region of
-    hardware_graph big enough for the program. Raises a clear ValueError
-    if the graph is disconnected in a way that makes the program
-    unroutable, instead of crashing or looping forever.
+    Robustness: restricts work to a connected region of hardware_graph big
+    enough for the program; raises a clear ValueError if unroutable.
 
-    Placement: for each possible seed location within that region, get a
-    weighted placement, refine it with one proper SABRE bidirectional pass
-    (forward, backward, forward).
+    Placement: two orderings (busiest-first, BFS clustering) x every
+    physical seed, each refined by 2-opt local search (QAP heuristic),
+    then one proper SABRE bidirectional pass (forward, backward, forward).
 
-    Routing: SABRE-style look-ahead with decay, with small randomized
-    tie-breaking tried a few times per placement seed. All runs are
-    seeded (via base_seed) so results are fully reproducible.
+    Routing: SABRE-style look-ahead with decay and randomized restarts,
+    post-processed to cancel adjacent redundant SWAP pairs.
     """
-    order, interaction_weight = _order_by_weight(program)
-    work_graph = _select_workable_component(hardware_graph, order)
+    order_weighted, interaction_weight = _order_by_weight(program)
+    order_bfs = _order_by_bfs_clustering(program, interaction_weight)
+    work_graph = _select_workable_component(hardware_graph, order_weighted)
 
     dist = dict(nx.all_pairs_shortest_path_length(work_graph))
     physical_nodes = list(work_graph.nodes)
@@ -210,37 +269,35 @@ def solve(program, hardware_graph, restarts_per_seed=3, base_seed=42):
     best_score, best_result = None, None
     attempt = 0
 
-    for seed in physical_nodes:
-        placement = _weighted_placement(order, interaction_weight, dist, physical_nodes, seed)
+    for order in (order_weighted, order_bfs):
+        for seed in physical_nodes:
+            greedy_placement = _weighted_placement(order, interaction_weight, dist, physical_nodes, seed)
+            placement = _two_opt_refine_placement(greedy_placement, interaction_weight, dist)
 
-        for _ in range(restarts_per_seed):
-            rng = random.Random(base_seed + attempt)
-            attempt += 1
+            for _ in range(restarts_per_seed):
+                rng = random.Random(base_seed + attempt)
+                attempt += 1
 
-            _, mid_placement = _route_sabre_with_final(
-                program, work_graph, placement, dist, rng=rng
-            )
-            _, mid_placement2 = _route_sabre_with_final(
-                reversed_program, work_graph, mid_placement, dist, rng=rng
-            )
-            routed, _ = _route_sabre_with_final(
-                program, work_graph, mid_placement2, dist, rng=rng
-            )
+                _, mid_placement = _route_sabre_with_final(
+                    program, work_graph, placement, dist, rng=rng, window=window
+                )
+                _, mid_placement2 = _route_sabre_with_final(
+                    reversed_program, work_graph, mid_placement, dist, rng=rng, window=window
+                )
+                routed, _ = _route_sabre_with_final(
+                    program, work_graph, mid_placement2, dist, rng=rng, window=window
+                )
 
-            # Validate against the ORIGINAL hardware_graph (work_graph's
-            # edges are a strict subset of it, so this is always meaningful).
-            result = score_summary(program, hardware_graph, mid_placement2, routed)
-            if not result["valid"]:
-                continue
-            if best_score is None or result["score"] < best_score:
-                best_score, best_result = result["score"], (mid_placement2, routed)
+                routed = _cancel_redundant_swaps(routed)
+
+                result = score_summary(program, hardware_graph, mid_placement2, routed)
+                if not result["valid"]:
+                    continue
+                if best_score is None or result["score"] < best_score:
+                    best_score, best_result = result["score"], (mid_placement2, routed)
 
     return best_result
 
-
-# ─────────────────────────────────────────────────────────────────
-# Overfitting check: fresh, never-tuned-against random programs
-# ─────────────────────────────────────────────────────────────────
 
 def _random_program(num_qubits, num_gates, seed):
     rng = random.Random(seed)
@@ -261,19 +318,13 @@ def _generalization_suite():
     }
 
 
-# ─────────────────────────────────────────────────────────────────
-# Robustness check: disconnected hardware graphs & oversized programs
-# ─────────────────────────────────────────────────────────────────
-
 def _robustness_suite():
-    print("\nROBUSTNESS CHECK (edge cases that used to crash)")
+    print("\nROBUSTNESS CHECK (edge cases)")
     print("-" * 60)
 
-    # 1. Disconnected hardware graph, but each island is big enough on its
-    #    own for a program that only uses qubits within one island.
     disconnected = nx.Graph()
-    disconnected.add_edges_from([(0, 1), (1, 2), (2, 3)])          # island A: 4 nodes
-    disconnected.add_edges_from([(10, 11), (11, 12), (12, 13)])    # island B: 4 nodes
+    disconnected.add_edges_from([(0, 1), (1, 2), (2, 3)])
+    disconnected.add_edges_from([(10, 11), (11, 12), (12, 13)])
     small_program = [("2Q", 0, 1), ("2Q", 1, 2), ("2Q", 2, 3)]
     try:
         result = solve(small_program, disconnected)
@@ -284,34 +335,25 @@ def _robustness_suite():
     except Exception as exc:
         print(f"1. Disconnected graph, program fits one island: CRASHED -> {exc}")
 
-    # 2. Disconnected hardware graph where the program genuinely can't fit
-    #    in any single island -> should raise a clear error, not crash.
-    too_big_program = [("2Q", i, i + 1) for i in range(7)]  # needs 8 qubits
+    too_big_program = [("2Q", i, i + 1) for i in range(7)]
     try:
         solve(too_big_program, disconnected)
-        print("2. Program too big for any single island: "
-              "did NOT raise an error (unexpected)")
+        print("2. Program too big for any single island: did NOT raise an error (unexpected)")
     except ValueError as exc:
         print(f"2. Program too big for any single island: PASS -> raised clear error: {exc}")
     except Exception as exc:
         print(f"2. Program too big for any single island: CRASHED with wrong error type -> {exc}")
 
-    # 3. Program needs more qubits than the ENTIRE hardware graph has.
-    tiny_graph = nx.path_graph(3)  # only 3 physical qubits
-    oversized_program = [("2Q", i, i + 1) for i in range(9)]  # needs 10 qubits
+    tiny_graph = nx.path_graph(3)
+    oversized_program = [("2Q", i, i + 1) for i in range(9)]
     try:
         solve(oversized_program, tiny_graph)
-        print("3. Program bigger than entire hardware graph: "
-              "did NOT raise an error (unexpected)")
+        print("3. Program bigger than entire hardware graph: did NOT raise an error (unexpected)")
     except ValueError as exc:
         print(f"3. Program bigger than entire hardware graph: PASS -> raised clear error: {exc}")
     except Exception as exc:
         print(f"3. Program bigger than entire hardware graph: CRASHED with wrong error type -> {exc}")
 
-
-# ─────────────────────────────────────────────────────────────────
-# Run everything
-# ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     GRAPH = build_hardware_graph()
