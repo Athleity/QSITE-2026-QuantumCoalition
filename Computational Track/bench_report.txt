@@ -1,0 +1,15 @@
+Q-SITE Computational Track — benchmark report
+seed = 0   budget = 20s   python = 3.14.2
+
+benchmark            score   swaps   depth     wall   valid
+------------------------------------------------------------
+ghz_star               6.5       2       9    18.4s   True
+chain_trotter          4.5       0       9     0.0s   True
+ladder_trotter         6.5       3       7    18.4s   True
+qaoa_random           11.5       6      11    18.5s   True
+dense_random          37.0      26      22    20.0s   True
+vqe_layers             3.0       0       6     0.0s   True
+------------------------------------------------------------
+TOTAL                 69.0
+
+baseline = 283.5   reduction = 75.7%
