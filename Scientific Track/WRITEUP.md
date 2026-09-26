@@ -2,6 +2,12 @@
 
 **Team IonQ · GitHub: Athleity · Q-SITE 2026 Scientific Track**
 
+## Presentation
+
+A 6-minute walkthrough: https://youtu.be/x8Bp4URWEVI
+
+---
+
 ## 1. Overview
 
 We mapped the phase diagram of the 1D ANNNI model in the (κ, h) plane using
