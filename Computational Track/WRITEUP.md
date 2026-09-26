@@ -1,6 +1,6 @@
 # Compiling Quantum Circuits onto a Sparse 20-Qubit Device
 
-**Team Athleity** · QIon · Q-SITE 2026 Computational Track
+**Team IonQ · GitHub: Athleity · Q-SITE 2026 Computational Track**
 
 **68.0 total** on the six public benchmarks. Baseline 283.5. All six
 verified by the official `starter_kit` scorer, none hidden behind a custom

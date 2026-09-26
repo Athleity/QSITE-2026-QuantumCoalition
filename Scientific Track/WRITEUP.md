@@ -1,5 +1,7 @@
 # ANNNI Phase Diagram Under Depolarizing Noise
 
+**Team IonQ · GitHub: Athleity · Q-SITE 2026 Scientific Track**
+
 ## 1. Overview
 
 We mapped the phase diagram of the 1D ANNNI model in the (κ, h) plane using
