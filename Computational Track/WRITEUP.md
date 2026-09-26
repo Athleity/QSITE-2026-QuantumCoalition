@@ -8,6 +8,12 @@ metric.
 
 ---
 
+## Demo
+
+A 4-minute walkthrough: https://youtu.be/_oUCP7Zyut4
+
+---
+
 ## The problem, briefly
 
 The task is quantum circuit compilation. We're given a program of one- and
@@ -214,7 +220,3 @@ starter kit does not provide.
 
 *Questions, corrections, or a case where our routing can be beaten? Open an
 issue on the repository. We'll take a look.*
-
-## Demo
-
-A 4-minute walkthrough: https://youtu.be/_oUCP7Zyut4
